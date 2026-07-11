@@ -159,7 +159,7 @@ def fallback_report(travel_date: str, recommendation: dict[str, Any], restaurant
 ## 맛집 리스트
 {places_text}
 
-## 1일 일정 제안
+## 일정 제안
 - 오전: 대표 명소를 방문합니다.
 - 오후: 지역 문화 공간과 카페를 둘러봅니다.
 - 저녁: 위 맛집 후보 중 한 곳에서 식사합니다.
@@ -172,7 +172,7 @@ def fallback_report(travel_date: str, recommendation: dict[str, Any], restaurant
 def create_report(client: OpenAI, travel_date: str, recommendation: dict[str, Any], restaurants_by_city: dict[str, list[dict[str, Any]]], errors: list[dict[str, str]]) -> str:
     context = json.dumps({"date": travel_date, "recommendation": recommendation, "restaurants_by_city": restaurants_by_city, "errors": errors}, ensure_ascii=False)
     prompt = f"""다음 JSON 데이터를 바탕으로 한국어 여행 리포트를 Markdown으로 작성하세요.
-반드시 '추천 지역', '추천 이유', '날씨 요약', '행사/축제', '맛집 리스트', '1일 일정 제안', 'Errors' 섹션을 포함하세요.
+반드시 '추천 지역', '추천 이유', '날씨 요약', '행사/축제', '맛집 리스트', '일정 제안', 'Errors' 섹션을 포함하세요.
 추천 지역이 여러 곳이면 맛집 리스트와 1일 일정 제안을 지역별 하위 섹션으로 정리하세요.
 어떤 지역의 맛집이 빈 배열이면 그 지역에 정확히 '데이터 없음'이라고 쓰세요. 사실을 새로 만들어내지 말고 제공 데이터를 중심으로 작성하세요.
 
