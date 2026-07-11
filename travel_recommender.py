@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,8 +35,16 @@ def parse_date(value: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LLM + 지도 API 국내 여행 추천 프로그램")
+    parser = argparse.ArgumentParser(
+        description="LLM + 지도 API 국내 여행 추천 프로그램",
+        epilog='사용 예: python travel_recommender.py -date "2026-08-15" (캐시 무시: --force-refresh 추가)',
+    )
     parser.add_argument("-date", required=True, type=parse_date, help='여행 날짜 (예: "2026-08-15")')
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="같은 날짜의 캐시(원본 JSON)가 있어도 무시하고 API를 다시 호출합니다.",
+    )
     return parser.parse_args()
 
 
@@ -60,15 +69,22 @@ def extract_json(text: str) -> dict[str, Any]:
     for key, expected_type in REQUIRED_RECOMMENDATION_KEYS.items():
         if not isinstance(data.get(key), expected_type):
             raise ValueError(f"LLM JSON의 필수 키 또는 타입이 올바르지 않습니다: {key}")
-    if not all(isinstance(event, str) for event in data["events"]):
-        raise ValueError("events는 문자열 배열이어야 합니다.")
+    # 키/타입에 더해 필드 제약(개수, 빈 문자열)까지 검증한다.
+    # 스키마가 이보다 복잡해지면 jsonschema 라이브러리 도입을 고려한다.
+    events = data["events"]
+    if not (1 <= len(events) <= 3) or not all(isinstance(event, str) and event.strip() for event in events):
+        raise ValueError("events는 비어 있지 않은 문자열 1~3개의 배열이어야 합니다.")
     cities = data["recommended_cities"]
-    if not cities or not all(isinstance(city, str) and city.strip() for city in cities):
-        raise ValueError("recommended_cities는 비어 있지 않은 문자열 배열이어야 합니다.")
+    if not (1 <= len(cities) <= 3) or not all(isinstance(city, str) and city.strip() for city in cities):
+        raise ValueError("recommended_cities는 비어 있지 않은 문자열 1~3개의 배열이어야 합니다.")
+    if not data["weather"].strip() or not data["reason"].strip():
+        raise ValueError("weather와 reason은 비어 있지 않은 문자열이어야 합니다.")
     return data
 
 
 def chat(client: OpenAI, messages: list[dict[str, str]], *, json_mode: bool = False) -> str:
+    # LLM 호출은 프롬프트 전체를 요청 본문(body)에 담아야 하므로 SDK 내부적으로 HTTP POST로 전송된다.
+    # (조회 성격의 Kakao 장소 검색은 쿼리스트링만 필요하므로 GET을 사용한다.)
     options: dict[str, Any] = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "messages": messages,
@@ -101,18 +117,37 @@ def get_recommendation(client: OpenAI, travel_date: str) -> dict[str, Any]:
         except (json.JSONDecodeError, ValueError) as exc:
             if attempt == 1:
                 raise ValueError(f"LLM 추천 JSON 파싱 실패: {exc}") from exc
+            print(f"    - JSON 검증 실패({exc}). 스키마를 다시 요구하며 1회 재시도합니다.")
             messages.append({"role": "assistant", "content": "직전 응답은 스키마 검증에 실패했습니다."})
             messages.append({"role": "user", "content": "필수 키와 타입을 정확히 지킨 JSON 객체만 다시 출력하세요."})
     raise RuntimeError("도달할 수 없는 코드")
 
 
+def normalize_city(city: str) -> str:
+    """LLM이 준 도시명을 검색용 표준 형태로 정리한다(공백/따옴표 정리 + 행정구역 접미사 제거)."""
+    cleaned = re.sub(r"\s+", " ", city).strip().strip("'\"")
+    for suffix in ("특별자치도", "특별자치시", "특별시", "광역시"):
+        if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+            cleaned = cleaned[: -len(suffix)]
+    return cleaned
+
+
 def search_restaurants(city: str, kakao_key: str) -> list[dict[str, Any]]:
-    response = requests.get(
-        "https://dapi.kakao.com/v2/local/search/keyword.json",
-        headers={"Authorization": f"KakaoAK {kakao_key}"},
-        params={"query": f"{city} 맛집", "size": 5},
-        timeout=10,
-    )
+    query = f"{normalize_city(city)} 맛집"
+    # 일시적 네트워크 오류(연결/타임아웃)만 지수 백오프로 1회 재시도한다. 인증 오류(4xx)는 재시도하지 않는다.
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                "https://dapi.kakao.com/v2/local/search/keyword.json",
+                headers={"Authorization": f"KakaoAK {kakao_key}"},
+                params={"query": query, "size": 5},
+                timeout=10,
+            )
+            break
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 1:
+                raise
+            time.sleep(2**attempt)
     response.raise_for_status()
     documents = response.json().get("documents", [])
     places: list[dict[str, Any]] = []
@@ -202,6 +237,23 @@ def load_cached_raw(raw_path: Path) -> dict[str, Any] | None:
         return None
 
 
+def make_error(step: str, error_type: str, message: str) -> dict[str, str]:
+    """오류 발생 시각까지 담아 사후 분석이 가능하도록 오류 항목을 만든다."""
+    return {
+        "step": step,
+        "type": error_type,
+        "message": message,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def write_atomic(path: Path, content: str) -> None:
+    """임시 파일에 쓴 뒤 원자적으로 교체해, 저장 중 중단돼도 기존 파일이 깨지지 않게 한다."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def main() -> int:
     args = parse_args()
     load_dotenv()
@@ -216,7 +268,9 @@ def main() -> int:
     raw_path = RESULTS_DIR / f"{args.date}_raw.json"
     report_path = RESULTS_DIR / f"{args.date}_travel_report.md"
 
-    cached = load_cached_raw(raw_path)
+    cached = None if args.force_refresh else load_cached_raw(raw_path)
+    if args.force_refresh and raw_path.exists():
+        print("[캐시] --force-refresh 옵션으로 기존 캐시를 무시하고 API를 다시 호출합니다.")
     if cached:
         print(f"[캐시] 기존 원본 데이터({raw_path})를 발견했습니다. 추천/맛집 API 호출을 건너뜁니다.")
         recommendation = cached["recommendation"]
@@ -239,11 +293,7 @@ def main() -> int:
             try:
                 places = search_restaurants(city, kakao_key)
                 if not places:
-                    errors.append({
-                        "step": "place_search",
-                        "type": "EMPTY_RESULT",
-                        "message": f"0 results for query={city} 맛집",
-                    })
+                    errors.append(make_error("place_search", "EMPTY_RESULT", f"0 results for query={city} 맛집"))
                     print(f"    - {city}: 검색 결과 0건. '데이터 없음'으로 처리하고 계속 진행합니다.")
                 else:
                     print(f"    - {city}: 맛집 {len(places)}곳 검색 완료")
@@ -251,9 +301,9 @@ def main() -> int:
                 places = []
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 error_type = "AUTH_ERROR" if status in (401, 403) else "API_ERROR"
-                errors.append({"step": "place_search", "type": error_type, "message": f"{city}: {safe_error(exc)}"})
+                errors.append(make_error("place_search", error_type, f"{city}: {safe_error(exc)}"))
                 if error_type == "AUTH_ERROR":
-                    print(f"    - {city}: 인증 실패({status}). Kakao REST API 키 설정을 확인하세요.")
+                    print(f"    - {city}: 인증 실패({status}). 점검 항목: 1) REST API 키 값 오타 2) Authorization 헤더의 'KakaoAK ' 접두사 3) Kakao Developers 앱의 플랫폼/권한 설정")
                 print(f"    - {city}: 맛집 정보를 가져오지 못했습니다. 리포트는 계속 생성합니다.")
             restaurants_by_city[city] = places
 
@@ -261,12 +311,12 @@ def main() -> int:
     try:
         report = create_report(client, args.date, recommendation, restaurants_by_city, errors)
     except Exception as exc:
-        errors.append({"step": "report_generation", "type": "LLM_ERROR", "message": safe_error(exc)})
+        errors.append(make_error("report_generation", "LLM_ERROR", safe_error(exc)))
         report = fallback_report(args.date, recommendation, restaurants_by_city, errors)
         print("[경고] 기본 템플릿으로 리포트를 생성했습니다.")
 
-    raw_path.write_text(json.dumps({"travel_date": args.date, "recommendation": recommendation, "restaurants_by_city": restaurants_by_city, "errors": errors}, ensure_ascii=False, indent=2), encoding="utf-8")
-    report_path.write_text(report, encoding="utf-8")
+    write_atomic(raw_path, json.dumps({"travel_date": args.date, "recommendation": recommendation, "restaurants_by_city": restaurants_by_city, "errors": errors}, ensure_ascii=False, indent=2))
+    write_atomic(report_path, report)
     print("[4/4] 저장 완료")
     print(f"- 원본 데이터: {raw_path}")
     print(f"- 여행 리포트: {report_path}")
